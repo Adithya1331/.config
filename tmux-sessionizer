@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- configuration ----
+TS_SEARCH_PATHS=(
+  "$HOME/documents/projects"
+  "$HOME/documents/notes"
+  "$HOME/documents"
+  "$HOME"
+)
+TS_MAX_DEPTH="${TS_MAX_DEPTH:-1}"
+
+# Compact, no-preview fzf UI (array avoids quoting bugs)
+if [[ -n "${FZF_OPTS:-}" ]]; then
+  read -r -a FZF_OPTS_ARR <<< "$FZF_OPTS"
+else
+  FZF_OPTS_ARR=(--ansi --prompt "session> " --height=40% --layout=reverse --border)
+fi
+
+# Optional debug (set TMUX_SESSIONIZER_DEBUG=1 in env)
+debug() {
+  [[ -n "${TMUX_SESSIONIZER_DEBUG:-}" ]] && echo "ts: $*" >&2 || true
+}
+
+# ---- utilities ----
+in_tmux() { [[ -n "${TMUX:-}" ]]; }
+has_tmux() { command -v tmux >/dev/null 2>&1; }
+has_fzf()  { command -v fzf  >/dev/null 2>&1; }
+
+sanitize_name() {
+  local dir="$1"
+  local base; base="$(basename -- "$dir")"
+  base="${base// /_}"
+  base="$(printf "%s" "$base" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '_')"
+  local shorthash
+  if command -v sha1sum >/dev/null 2>&1; then
+    shorthash="$(printf "%s" "$dir" | sha1sum | cut -c1-6)"
+  else
+    shorthash="$(printf "%s" "$dir" | md5sum | cut -c1-6 2>/dev/null || echo "sess")"
+  fi
+  printf "%s_%s" "$base" "$shorthash"
+}
+
+is_python_proj() {
+  local d="$1"
+  [[ -f "$d/pyproject.toml" ]] || [[ -f "$d/setup.cfg" ]] || [[ -f "$d/requirements.txt" ]] || [[ -d "$d/.venv" ]] || [[ -d "$d/venv" ]]
+}
+
+list_sessions() {
+  if in_tmux; then
+    local current; current="$(tmux display-message -p '#S' 2>/dev/null || true)"
+    tmux list-sessions -F "[TMUX] #{session_name}" 2>/dev/null | grep -vFx "[TMUX] $current" || true
+  else
+    tmux list-sessions -F "[TMUX] #{session_name}" 2>/dev/null || true
+  fi
+}
+
+list_dirs() {
+  local path depth
+  for entry in "${TS_SEARCH_PATHS[@]}"; do
+    path="$entry"
+    depth="$TS_MAX_DEPTH"
+    if [[ "$entry" =~ ^([^:]+):([0-9]+)$ ]]; then
+      path="${BASH_REMATCH[1]}"
+      depth="${BASH_REMATCH[2]}"
+    fi
+    [[ -d "$path" ]] || continue
+    find "$path" -mindepth 1 -maxdepth "$depth" -path '*/.git' -prune -o -type d -print
+  done
+}
+
+rank_and_emit() {
+  while IFS= read -r d; do
+    if is_python_proj "$d"; then
+      printf "[PY] %s\n" "$d"
+    else
+      printf "[DIR] %s\n" "$d"
+    fi
+  done | awk '
+    BEGIN { py_count=0; dir_count=0 }
+    /^\[PY\]/  { py[py_count++]=$0; next }
+    /^\[DIR\]/ { dr[dir_count++]=$0; next }
+    END {
+      for(i=0;i<py_count;i++) print py[i];
+      for(i=0;i<dir_count;i++) print dr[i];
+    }'
+}
+
+# Wait for a pane target to appear (try a few times)
+get_first_pane_target() {
+  local name="$1"
+  local tries=0
+  local target=""
+  until [[ -n "$target" || $tries -ge 10 ]]; do
+    target="$(tmux list-panes -t "$name" -F '#S:#I.#P' 2>/dev/null | head -n1 || true)"
+    if [[ -n "$target" ]]; then
+      printf "%s" "$target"
+      return 0
+    fi
+    tries=$((tries+1))
+    sleep 0.05
+  done
+  return 1
+}
+
+# Create session detached if missing. sets NEW_CREATED=1 if created, 0 otherwise.
+create_session_if_missing() {
+  local name="$1" dir="$2"
+  NEW_CREATED=0
+  if ! tmux has-session -t "$name" 2>/dev/null; then
+    debug "creating session $name (cwd=$dir)"
+    tmux new-session -d -s "$name" -c "$dir"
+    NEW_CREATED=1
+  else
+    debug "session $name already exists"
+  fi
+}
+
+# Hydrate python environment into the first pane of session $1
+hydrate_python() {
+  local name="$1" dir="$2"
+  local target
+  target="$(get_first_pane_target "$name")" || {
+    debug "failed to get pane target for $name"
+    return 1
+  }
+  debug "hydrating session $name at pane $target using dir $dir"
+
+  # prefer .venv, then venv, then poetry/pipenv
+  if [[ -f "$dir/.venv/bin/activate" ]]; then
+    tmux send-keys -t "$target" "cd \"$dir\" && source \"$dir/.venv/bin/activate\"" C-m
+    debug "sent .venv activation"
+  elif [[ -f "$dir/venv/bin/activate" ]]; then
+    tmux send-keys -t "$target" "cd \"$dir\" && source \"$dir/venv/bin/activate\"" C-m
+    debug "sent venv activation"
+  elif [[ -f "$dir/pyproject.toml" ]] && command -v poetry >/dev/null 2>&1 && grep -q "^\[tool\.poetry\]" "$dir/pyproject.toml"; then
+    tmux send-keys -t "$target" "cd \"$dir\" && poetry shell" C-m
+    debug "sent poetry shell"
+  elif [[ -f "$dir/Pipfile" ]] && command -v pipenv >/dev/null 2>&1; then
+    tmux send-keys -t "$target" "cd \"$dir\" && pipenv shell" C-m
+    debug "sent pipenv shell"
+  else
+    debug "no known python env found for $dir"
+  fi
+}
+
+# ---- main ----
+has_tmux || { echo "tmux is required"; exit 1; }
+has_fzf  || { echo "fzf is required";  exit 1; }
+
+selected="${1:-}"
+
+if [[ -z "${selected}" ]]; then
+  mapfile -t choices < <(
+    { list_sessions; list_dirs | rank_and_emit; } | awk '!seen[$0]++'
+  )
+  [[ "${#choices[@]}" -gt 0 ]] || { echo "No candidates found"; exit 0; }
+  selected="$(printf "%s\n" "${choices[@]}" | fzf "${FZF_OPTS_ARR[@]}")"
+fi
+
+[[ -n "${selected}" ]] || exit 0
+
+if [[ "$selected" =~ ^\[TMUX\]\ (.+)$ ]]; then
+  session_name="${BASH_REMATCH[1]}"
+  # If it's an existing tmux session, just switch/attach.
+  if in_tmux; then
+    tmux switch-client -t "$session_name"
+  else
+    tmux attach-session -t "$session_name"
+  fi
+  exit 0
+fi
+
+# directory selected
+selected="${selected#*\] }"
+case "$selected" in
+  ~*) selected="${selected/#~/$HOME}" ;;
+esac
+selected="$(realpath -m -- "$selected" 2>/dev/null || echo "$selected")"
+[[ -d "$selected" ]] || { echo "Not a directory: $selected"; exit 1; }
+
+session_name="$(sanitize_name "$selected")"
+
+# Create session detached if missing
+create_session_if_missing "$session_name" "$selected"
+
+# If we created a new session, hydrate it BEFORE attaching/switching
+if [[ "${NEW_CREATED:-0}" -eq 1 ]]; then
+  hydrate_python "$session_name" "$selected" || debug "hydrate returned non-zero"
+fi
+
+# Finally attach / switch to the session
+if in_tmux; then
+  tmux switch-client -t "$session_name"
+else
+  tmux attach-session -t "$session_name"
+fi
+
